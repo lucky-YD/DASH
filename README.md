@@ -3,8 +3,6 @@ ICASSP 2026 (Submission)
 
 ## This project implements a dual-branch deep learning model (DASH), specifically designed for heart rate prediction tasks. The model extracts features from inputs through two parallel Swin Transformer branches and then fuses these features to perform final heart rate prediction.
 
-## # DASH: Dual-Branch Multi-Layer Self-Attention Network for Heart Rate Prediction
-
 ## Core Features
 - **Feature 1: 2D Time-Frequency Input**: Converts 1D physiological signals into 2D time-frequency images, preserving both temporal and frequency information for richer feature extraction
 - **Feature 2: Time-Domain Windowing**: Processes long time-series signals through windowing, enhancing the model's ability to capture dynamic changes and improving temporal resolution of predictions
