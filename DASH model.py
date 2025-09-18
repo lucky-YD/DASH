@@ -265,9 +265,14 @@ class BasicLayer(nn.Module):
                 x = checkpoint(blk, x)
             else:
                 x = blk(x)
+        
+        # 保存当前stage的输出特征用于下采样前
+        stage_output = x
+        
         if self.downsample is not None:
             x = self.downsample(x)
-        return x
+            
+        return x, stage_output
 
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=224, patch_size=4, in_chans=1, embed_dim=32, norm_layer=None, device=None):
@@ -304,7 +309,7 @@ class PatchEmbed(nn.Module):
         return x
 
 class SwinBranch(nn.Module):
-    """单个Swin Transformer分支，输出[8,8,C]特征图"""
+    """单个Swin Transformer分支，输出每个stage的特征图"""
     def __init__(self, img_size=256, patch_size=4, in_chans=1,
                  embed_dim=32, depths=[2, 2, 6, 2], num_heads=[1, 2, 4, 8],
                  window_size=8, mlp_ratio=4., qkv_bias=True, qk_scale=None,
@@ -348,7 +353,7 @@ class SwinBranch(nn.Module):
         # 构建各个阶段
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            # 最后一层不进行下采样，以保持8x8输出
+            # 最后一层不进行下采样
             downsample = PatchMerging if (i_layer < self.num_layers - 1) else None
             layer = BasicLayer(
                 dim=int(embed_dim * 2** i_layer),
@@ -374,34 +379,87 @@ class SwinBranch(nn.Module):
     def forward(self, x):
         x = x.to(self.device)
         x = self.patch_embed(x)  # (B, N, C)
+        
+        # 保存patch嵌入后的特征作为第一个stage特征
+        stage_features = []
+        H, W = self.patch_grid
+        stage_features.append(x.view(x.shape[0], H, W, -1).permute(0, 3, 1, 2).contiguous())
+        
         if self.ape and self.absolute_pos_embed is not None:
             x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
 
-        # 经过各个阶段
-        for layer in self.layers:
-            x = layer(x)
+        # 经过各个阶段，收集每个stage的特征
+        for i, layer in enumerate(self.layers):
+            x, stage_out = layer(x)
+            
+            # 计算当前stage的特征图尺寸
+            size = int(stage_out.shape[1] **0.5)
+            # 转换为 [B, C, H, W] 格式并添加到列表
+            stage_feat = stage_out.view(x.shape[0], size, size, -1).permute(0, 3, 1, 2).contiguous()
+            stage_features.append(stage_feat)
 
+        # 处理最终输出
         x = self.norm(x)  # (B, N, C)
+        final_size = int(x.shape[1]** 0.5)
+        final_feat = x.view(x.shape[0], final_size, final_size, -1).permute(0, 3, 1, 2).contiguous()
         
-        # 计算最终特征图尺寸 (8x8)
-        final_size = int(x.shape[1] **0.5)
-        # 重塑为 [B, 8, 8, C] 然后转置为 [B, C, 8, 8]
-        x = x.view(x.shape[0], final_size, final_size, -1).permute(0, 3, 1, 2).contiguous()
+        # stage_features包含所有stage的特征，final_feat是最终输出特征
+        return final_feat, stage_features
+
+def mmd_loss(x, y, kernel_type='rbf', kernel_mul=2.0, kernel_num=5):
+    """
+    计算两个分布之间的最大均值差异(MMD)损失
+    """
+    def guassian_kernel(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
+        n_samples = int(source.size()[0]) + int(target.size()[0])
+        total = torch.cat([source, target], dim=0)
         
-        return x
+        total0 = total.unsqueeze(0).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
+        total1 = total.unsqueeze(1).expand(int(total.size(0)), int(total.size(0)), int(total.size(1)))
+        L2_distance = ((total0 - total1) **2).sum(2) 
+        
+        if fix_sigma:
+            bandwidth = fix_sigma
+        else:
+            bandwidth = torch.sum(L2_distance.data) / (n_samples** 2 - n_samples)
+        
+        bandwidth /= kernel_mul **(kernel_num // 2)
+        bandwidth_list = [bandwidth * (kernel_mul** i) for i in range(kernel_num)]
+        
+        kernel_val = [torch.exp(-L2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list]
+        return sum(kernel_val)
+    
+    # 展平特征图为向量
+    x_flat = x.view(x.size(0), -1)
+    y_flat = y.view(y.size(0), -1)
+    
+    if kernel_type == 'rbf':
+        kernels = guassian_kernel(x_flat, y_flat, kernel_mul=kernel_mul, kernel_num=kernel_num)
+    else:
+        raise NotImplementedError(f"不支持的核函数类型: {kernel_type}")
+    
+    batch_size = x.size(0)
+    XX = kernels[:batch_size, :batch_size]
+    YY = kernels[batch_size:, batch_size:]
+    XY = kernels[:batch_size, batch_size:]
+    YX = kernels[batch_size:, :batch_size]
+    
+    loss = torch.mean(XX) + torch.mean(YY) - 2 * torch.mean(XY)
+    return loss
 
 class TwoBranchSwinHeartRate(nn.Module):
-    """双分支Swin Transformer用于心率预测"""
+    """双分支Swin Transformer用于心率预测，带各stage的MMD损失"""
     def __init__(self, img_size=256, patch_size=4, in_chans=1,
                  embed_dim=32, depths=[2, 2, 6, 2], num_heads=[1, 2, 4, 8],
                  window_size=8, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
-                 use_checkpoint=False, device=None,** kwargs):
+                 use_checkpoint=False, device=None, mmd_weight=0.1,** kwargs):
         super().__init__()
         
         self.device = device if device is not None else (torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        self.mmd_weight = mmd_weight  # MMD损失权重
         
         # 创建两个并行的Swin分支
         self.branch1 = SwinBranch(
@@ -478,10 +536,21 @@ class TwoBranchSwinHeartRate(nn.Module):
         """
         x1: 第一个分支的输入 (B, C, H, W)
         x2: 第二个分支的输入 (B, C, H, W)
+        返回: 心率预测值, 总MMD损失, 各stage的MMD损失列表
         """
-        # 两个分支分别处理输入
-        feat1 = self.branch1(x1)*0.1  # (B, C, 8, 8)
-        feat2 = self.branch2(x2)  # (B, C, 8, 8)
+        # 两个分支分别处理输入，获取最终特征和各stage特征
+        feat1, stage_feats1 = self.branch1(x1)
+        feat2, stage_feats2 = self.branch2(x2)
+        
+        # 计算每个stage的MMD损失
+        stage_mmd_losses = []
+        for feat_a, feat_b in zip(stage_feats1, stage_feats2):
+            # 对每个stage的特征计算MMD损失
+            loss = mmd_loss(feat_a, feat_b)
+            stage_mmd_losses.append(loss)
+        
+        # 计算总MMD损失
+        total_mmd_loss = torch.mean(torch.stack(stage_mmd_losses)) * self.mmd_weight
         
         # 拼接特征图 [B, 2*C, 8, 8]
         fused_feat = torch.cat([feat1, feat2], dim=1)
@@ -492,8 +561,7 @@ class TwoBranchSwinHeartRate(nn.Module):
         # 预测心率
         heart_rate = self.predict_head(fused_feat)
         
-        return heart_rate
-
+        return heart_rate, total_mmd_loss, stage_mmd_losses
 
 
 # 测试模型
@@ -511,7 +579,8 @@ if __name__ == "__main__":
         depths=[2, 2, 6, 2],
         num_heads=[1, 2, 4, 8],
         window_size=8,
-        device=device
+        device=device,
+        mmd_weight=0.1
     )
     
     # 生成两个随机输入 (B, C, H, W)
@@ -519,18 +588,10 @@ if __name__ == "__main__":
     input2 = torch.randn(64, 1, 256, 256).to(device)
     
     # 前向传播
-    output = model(input1, input2)
+    output, total_mmd, stage_mmds = model(input1, input2)
     print(f"输入1形状: {input1.shape}")
     print(f"输入2形状: {input2.shape}")
-    print(f"输出心率预测: {output.shape}")  
-    print(f"模型参数所在设备: {next(model.parameters()).device}")
-    
-    # 查看中间特征形状
-    with torch.no_grad():
-        feat1 = model.branch1(input1)
-        feat2 = model.branch2(input2)
-        print(f"分支1输出特征形状: {feat1.shape}")  # 应为 [2, 256, 8, 8]
-        print(f"分支2输出特征形状: {feat2.shape}")  # 应为 [2, 256, 8, 8]
-        fused_feat = torch.cat([feat1, feat2], dim=1)
-        print(f"拼接后特征形状: {fused_feat.shape}")  # 应为 [2, 512, 8, 8]
+    print(f"输出心率预测形状: {output.shape}")  
+    print(f"总MMD损失: {total_mmd.item()}")
+    print(f"各stage MMD损失: {[loss.item() for loss in stage_mmds]}")
 
