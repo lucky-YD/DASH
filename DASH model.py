@@ -522,7 +522,7 @@ if __name__ == "__main__":
     output = model(input1, input2)
     print(f"输入1形状: {input1.shape}")
     print(f"输入2形状: {input2.shape}")
-    print(f"输出心率预测: {output.shape}")  # 应为 [2, 1]
+    print(f"输出心率预测: {output.shape}")  
     print(f"模型参数所在设备: {next(model.parameters()).device}")
     
     # 查看中间特征形状
