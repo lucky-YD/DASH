@@ -1,5 +1,4 @@
 # DASH
-ICASSP 2026 (Submission)
 
 ## This project implements a dual-branch deep learning model (DASH), specifically designed for heart rate prediction tasks. The model extracts features from inputs through two parallel Swin Transformer branches and then fuses these features to perform final heart rate prediction.
 
